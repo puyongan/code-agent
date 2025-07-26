@@ -110,6 +110,4 @@ just agent
     - `info.py`: 项目信息和配置
     - `pretty.py`: 统一日志输出系统
 - `justfile`: 任务运行配置文件
-#   c o d e - a g e n t 
- 
  
