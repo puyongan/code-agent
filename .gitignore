@@ -174,5 +174,5 @@ cython_debug/
 .pypirc
 .vscode/settings.json
 
-README.md
+
 .idea/

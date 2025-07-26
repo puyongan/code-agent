@@ -1,3 +1,8 @@
+# 修复包导入错误
+import sys , os
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(base_dir)
+
 import sys
 import os
 import asyncio
@@ -9,11 +14,7 @@ from rich.console import Console
 from rich.text import Text
 
 from augmented.chat_openai import AsyncChatOpenAI
-
-base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(base_dir)
-
-from augmented.agent import Agent  # 直接复用你的 Agent 类
+from augmented.agent import Agent
 from augmented.mcp_client import MCPClient
 from augmented.mcp_tools import PresetMcpTools
 from augmented.utils.info import (
@@ -21,16 +22,15 @@ from augmented.utils.info import (
     DEFAULT_MODEL_NAME
 )
 from augmented.utils import pretty
-from augmented.utils.info import DEFAULT_MODEL_NAME, PROJECT_ROOT_DIR
 
 PRETTY_LOGGER = pretty.ALogger("[Agent]")
 
-# 全局状态：保存对话历史和 Agent 实例（多轮对话支持）
+
 class State:
     def __init__(self):
         self.agent: Agent | None = None
-        self.chat_history: List[Dict[str, str]] = []  # 多轮对话历史
-        self.console = Console(record=True)  # 捕获 rich 输出
+        self.chat_history: List[List[str]] = []  # Gradio格式：[[user, assistant], ...]
+        self.console = Console(record=True)
 
 
 state = State()
@@ -39,7 +39,6 @@ state = State()
 async def init_agent_if_needed(model_name: str, base_url: str, api_key: str) -> Agent:
     """初始化 Agent（仅在首次或模型参数变化时）"""
     if state.agent is None:
-        # 复用你的 MCP 客户端配置（和 example() 完全一致）
         mcp_clients = []
         for mcp_tool in [
             PresetMcpTools.filesystem.append_mcp_params(f" {PROJECT_ROOT_DIR!s}"),
@@ -49,17 +48,9 @@ async def init_agent_if_needed(model_name: str, base_url: str, api_key: str) -> 
             mcp_client = MCPClient(**mcp_tool.to_common_params())
             mcp_clients.append(mcp_client)
 
-        # 完全复用你的 Agent 初始化逻辑（包括 system_prompt）
         state.agent = Agent(
             model=model_name or DEFAULT_MODEL_NAME,
             mcp_clients=mcp_clients,
-        )
-        # 初始化 LLM（保留你的 system_prompt）
-        state.agent.llm = AsyncChatOpenAI(
-            model_name or DEFAULT_MODEL_NAME,
-            tools=[],  # 由 agent.init() 自动填充
-            system_prompt=state.agent.system_prompt,  # 关键：保留你的 system prompt
-            context=state.agent.context,
         )
         await state.agent.init()
         PRETTY_LOGGER.title("Agent 初始化完成")
@@ -72,39 +63,44 @@ async def gradio_query(
         base_url: str,
         api_key: str,
         temperature: float,
-        chat_history: List[Dict[str, str]]
-) -> AsyncGenerator[tuple[str, str, List[Dict[str, str]]], None]:
-    """完全复用 Agent 的多轮对话和输出逻辑，分离工具调用和最终响应"""
-    tool_call_text = ""  # 左侧工具调用详情
-    response_text = ""  # 右侧最终响应内容
+        history: List[List[str]]
+) -> AsyncGenerator[tuple[List[List[str]], str], None]:
+    """
+    改进版：完全分离工具调用和对话内容
+    返回: (chat_history, tool_logs)
+    """
+    tool_logs = "🔧 工具调用日志\n" + "=" * 50 + "\n"
 
     try:
         # 1. 初始化 Agent
         agent = await init_agent_if_needed(model_name, base_url, api_key)
-        agent.llm.temperature = temperature
-        tool_call_text += "初始化完成，开始处理查询...\n"
-        yield tool_call_text, response_text, chat_history
+        tool_logs += "✅ Agent初始化完成\n\n"
 
-        # 2. 记录用户查询到历史
-        chat_history.append({"role": "user", "content": query})
+        # 2. 添加用户消息到历史（但先不显示assistant回复）
+        current_history = history.copy()
+        current_history.append([query, ""])  # 占位，等待回复
+        yield current_history, tool_logs
 
         # 3. 处理多轮工具调用
         chat_resp = await agent.llm.chat(query)
-        i = 0
+        round_num = 0
 
         while True:
-            i += 1
-            tool_call_text += f"\n=== 处理轮次 {i} ===\n"
+            round_num += 1
+            tool_logs += f"📍 第 {round_num} 轮处理\n"
+            yield current_history, tool_logs
 
-            # 处理工具调用（只在左侧显示）
             if chat_resp.tool_calls:
-                for tool_call in chat_resp.tool_calls:
-                    tool_info = f"🛠️ TOOL USE: {tool_call.function.name}\n  ARGS: {tool_call.function.arguments}\n"
-                    tool_call_text += tool_info
-                    yield tool_call_text, response_text, chat_history
+                # 工具调用阶段 - 只在左侧显示详情
+                for idx, tool_call in enumerate(chat_resp.tool_calls, 1):
+                    tool_logs += f"  🛠️ 工具 {idx}: {tool_call.function.name}\n"
+                    tool_logs += f"     参数: {tool_call.function.arguments}\n"
+                    yield current_history, tool_logs
 
+                    # 执行工具
                     target_mcp_client = next(
-                        (c for c in agent.mcp_clients if tool_call.function.name in [t.name for t in c.get_tools()]),
+                        (c for c in agent.mcp_clients
+                         if tool_call.function.name in [t.name for t in c.get_tools()]),
                         None
                     )
 
@@ -113,162 +109,157 @@ async def gradio_query(
                             tool_call.function.name,
                             json.loads(tool_call.function.arguments),
                         )
-                        tool_call_text += f"✅ RESULT: {str(mcp_result)}\n\n"
-                        yield tool_call_text, response_text, chat_history
+                        result_preview = str(mcp_result)[:200] + "..." if len(str(mcp_result)) > 200 else str(
+                            mcp_result)
+                        tool_logs += f"     ✅ 结果: {result_preview}\n\n"
+                        yield current_history, tool_logs
+
                         agent.llm.append_tool_result(tool_call.id, mcp_result.model_dump_json())
                     else:
-                        tool_call_text += f"❌ 错误: 工具未找到\n"
-                        yield tool_call_text, response_text, chat_history
+                        tool_logs += f"     ❌ 错误: 工具未找到\n\n"
+                        yield current_history, tool_logs
                         return
 
-                # 继续下一轮对话
+                # 继续下一轮
                 chat_resp = await agent.llm.chat()
             else:
-                # 4. 最终响应（只在右侧显示）
-                response_text = chat_resp.content
-                chat_history.append({"role": "assistant", "content": response_text})
-                yield tool_call_text, response_text, chat_history
+                # 最终响应阶段 - 更新右侧对话历史
+                final_response = chat_resp.content
+                current_history[-1][1] = final_response  # 填充assistant回复
+                tool_logs += f"✅ 处理完成，共 {round_num} 轮\n"
+                yield current_history, tool_logs
                 break
 
     except Exception as e:
         error_msg = f"❌ 处理失败: {str(e)}"
-        response_text = error_msg
-        yield tool_call_text, response_text, chat_history
-    finally:
-        pass
+        tool_logs += f"\n{error_msg}\n"
+        if current_history and current_history[-1][1] == "":
+            current_history[-1][1] = error_msg
+        yield current_history, tool_logs
 
 
+def clear_history():
+    """清空对话历史"""
+    return [], "🔧 工具调用日志\n" + "=" * 50 + "\n已清空历史\n"
 
 
+def reset_agent():
+    """重置Agent"""
+    global state
+    if state.agent:
+        # 这里可以添加cleanup逻辑
+        state.agent = None
+    return [], "🔧 工具调用日志\n" + "=" * 50 + "\n已重置Agent\n"
 
 
-
-
-# async def gradio_query(
-#         query: str,
-#         model_name: str,
-#         base_url: str,
-#         api_key: str,
-#         temperature: float,
-#         chat_history: List[Dict[str, str]]
-# ) -> AsyncGenerator[tuple[str, str, List[Dict[str, str]]], None]:
-#     """完全复用 Agent 的多轮对话和输出逻辑"""
-#     tool_call_text = ""
-#     full_response = ""
-#     state.console.clear()  # 清空 rich 控制台缓存
-#
-#     try:
-#         # 1. 初始化 Agent（复用你的核心逻辑）
-#         agent = await init_agent_if_needed(model_name, base_url, api_key)
-#         agent.llm.temperature = temperature  # 设置温度
-#         yield tool_call_text, "初始化完成，开始处理查询...", chat_history
-#
-#         # 2. 维护多轮对话历史（新增）
-#         state.chat_history = chat_history.copy()
-#         state.chat_history.append({"role": "user", "content": query})
-#
-#         # 3. 复用 Agent 的多轮工具调用逻辑（改造为流式输出）
-#         chat_resp = await agent.llm.chat(query)  # 首次调用
-#         i = 0
-#
-#         while True:
-#             # 输出轮次信息（和你的 Agent 输出一致）
-#             轮次信息 = f"\n=== 处理轮次 {i} ==="
-#             full_response += 轮次信息
-#             yield tool_call_text, full_response, state.chat_history
-#             i += 1
-#
-#             # 处理工具调用（完全复用你的逻辑）
-#             if chat_resp.tool_calls:
-#                 for tool_call in chat_resp.tool_calls:
-#                     # 输出工具调用信息（和你的 rprint 一致）
-#                     tool_info = f"TOOL USE `{tool_call.function.name}`\nwith args: {tool_call.function.arguments}"
-#                     tool_call_text += tool_info + "\n"
-#                     full_response += f"\n工具调用: {tool_call.function.name}\n"
-#                     yield tool_call_text, full_response, state.chat_history
-#
-#                     # 查找目标 MCP 客户端（复用你的逻辑）
-#                     target_mcp_client = next(
-#                         (c for c in agent.mcp_clients if tool_call.function.name in [t.name for t in c.get_tools()]),
-#                         None
-#                     )
-#
-#                     if target_mcp_client:
-#                         # 调用工具（复用你的 call_tool）
-#                         mcp_result = await target_mcp_client.call_tool(
-#                             tool_call.function.name,
-#                             json.loads(tool_call.function.arguments),
-#                         )
-#                         # 输出工具返回结果（和你的 rprint 一致）
-#                         result_str = f"工具返回: {str(mcp_result)}\n"
-#                         full_response += result_str
-#                         tool_call_text += result_str
-#                         yield tool_call_text, full_response, state.chat_history
-#
-#                         # 记录工具结果（复用你的 append_tool_result）
-#                         agent.llm.append_tool_result(tool_call.id, mcp_result.model_dump_json())
-#                     else:
-#                         error = "工具未找到"
-#                         full_response += f"\n错误: {error}\n"
-#                         yield tool_call_text, full_response, state.chat_history
-#                         return
-#
-#                 # 多轮对话：继续调用 LLM（复用你的逻辑）
-#                 chat_resp = await agent.llm.chat()
-#             else:
-#                 # 输出最终结果（和你的返回一致）
-#                 final_resp = f"\n最终结果: {chat_resp.content}"
-#                 full_response += final_resp
-#                 state.chat_history.append({"role": "assistant", "content": chat_resp.content})
-#                 yield tool_call_text, full_response, state.chat_history
-#                 break
-#
-#     except Exception as e:
-#         # 错误处理（复用你的异常输出）
-#         error_msg = f"处理失败: {str(e)}"
-#         yield tool_call_text, error_msg, state.chat_history
-#     finally:
-#         # 保留你的 cleanup 逻辑（不清理，支持多轮对话）
-#         pass
-
-# 初始化 rich 控制台（复用你的输出格式）
-state.console = Console()
-
-# Gradio 界面（保留你的输出风格）
-with gr.Blocks(title="MCP Agent 交互界面") as demo:
-    gr.Markdown("## 🤖 MCP Agent 交互平台（复用原始逻辑）")
-
-    # 多轮对话历史状态（新增）
-    chat_history = gr.State([])
+# Gradio 界面
+with gr.Blocks(title="Schneider Agent 交互界面", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# Schneider Agent 交互平台")
+    gr.Markdown("左侧显示工具调用详情，右侧显示对话内容，支持多轮连续对话")
 
     with gr.Row():
-        # 左侧参数区
+        # 左侧：配置 + 工具日志
         with gr.Column(scale=1):
-            gr.Markdown("### 🧠 模型配置")
-            model_name = gr.Textbox(label="模型名称", value=DEFAULT_MODEL_NAME)
-            base_url = gr.Textbox(label="API 地址", value=os.environ.get("OPENAI_BASE_URL"))
-            api_key = gr.Textbox(label="API Key", type="password", value=os.environ.get("OPENAI_API_KEY"))
-            temperature = gr.Slider(label="温度", minimum=0.0, maximum=1.0, value=0.0, step=0.1)  # 你的默认温度是 0
+            gr.Markdown("### ⚙️ 模型配置")
+            model_name = gr.Textbox(
+                label="模型名称",
+                value=DEFAULT_MODEL_NAME,
+                placeholder="如: gpt-4, claude-3-5-sonnet"
+            )
+            base_url = gr.Textbox(
+                label="API 地址",
+                value=os.environ.get("OPENAI_BASE_URL", ""),
+                placeholder="如: https://api.openai.com/v1"
+            )
+            api_key = gr.Textbox(
+                label="API Key",
+                type="password",
+                value=os.environ.get("OPENAI_API_KEY", ""),
+                placeholder="输入你的API密钥"
+            )
+            temperature = gr.Slider(
+                label="温度",
+                minimum=0.0,
+                maximum=1.0,
+                value=0.1,
+                step=0.1
+            )
 
-            # 工具调用记录（复用你的输出）
-            tool_status = gr.Textbox(label="🛠️ 工具调用详情", lines=10, interactive=False)
+            with gr.Row():
+                clear_btn = gr.Button("🗑️ 清空历史", size="sm")
+                reset_btn = gr.Button("🔄 重置Agent", size="sm")
 
-        # 右侧输出区（保留你的输出格式）
+            # 工具调用日志区域
+            tool_status = gr.Textbox(
+                label="🔧 工具调用详情",
+                value="🔧 工具调用日志\n" + "=" * 50 + "\n等待查询...\n",
+                lines=15,
+                max_lines=20,
+                interactive=False,
+                show_copy_button=True
+            )
+
+        # 右侧：对话区域
         with gr.Column(scale=2):
-            gr.Markdown("### 💬 输出结果（与 Agent 原生输出一致）")
-            result_display = gr.Textbox(label="生成内容", lines=20, show_copy_button=True)
+            gr.Markdown("### 💬 对话历史")
 
-    # 底部输入区 + 多轮对话
-    with gr.Row():
-        query_input = gr.Textbox(label="❓ 输入查询", placeholder="请输入你的问题...", scale=4)
-        generate_btn = gr.Button("🚀 开始处理", scale=1, variant="primary")
+            # 使用Chatbot组件显示对话历史
+            chatbot = gr.Chatbot(
+                value=[],
+                height=400,
+                show_copy_button=True,
+                bubble_full_width=False,
+                show_share_button=False
+            )
 
-    # 绑定交互逻辑（多轮对话 + 流式输出）
-    generate_btn.click(
+            # 输入区域
+            with gr.Row():
+                msg_input = gr.Textbox(
+                    label="输入消息",
+                    placeholder="请输入你的问题...",
+                    scale=4,
+                    show_label=False
+                )
+                send_btn = gr.Button("🚀 发送", scale=1, variant="primary")
+
+            gr.Markdown("💡 **提示**: 支持多轮对话，工具调用详情会显示在左侧")
+
+    # 绑定事件
+    send_btn.click(
         fn=gradio_query,
-        inputs=[query_input, model_name, base_url, api_key, temperature, chat_history],
-        outputs=[tool_status, result_display, chat_history]
+        inputs=[msg_input, model_name, base_url, api_key, temperature, chatbot],
+        outputs=[chatbot, tool_status]
+    ).then(
+        lambda: "",  # 清空输入框
+        outputs=[msg_input]
+    )
+
+    # 回车发送
+    msg_input.submit(
+        fn=gradio_query,
+        inputs=[msg_input, model_name, base_url, api_key, temperature, chatbot],
+        outputs=[chatbot, tool_status]
+    ).then(
+        lambda: "",
+        outputs=[msg_input]
+    )
+
+    # 清空和重置按钮
+    clear_btn.click(
+        fn=clear_history,
+        outputs=[chatbot, tool_status]
+    )
+
+    reset_btn.click(
+        fn=reset_agent,
+        outputs=[chatbot, tool_status]
     )
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="localhost", server_port=9999, auth=("zhangsan", "123456"))
+    demo.queue().launch(
+        server_name="localhost",
+        server_port=9999,
+        auth=("zhangsan", "123456"),
+        share=False,
+        debug=True
+    )

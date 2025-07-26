@@ -1,5 +1,4 @@
 import sys, os
-
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(base_dir)
 import asyncio
@@ -20,23 +19,15 @@ class Agent:
     model: str
     llm: AsyncChatOpenAI | None = None
     system_prompt: str = '''
-对于代码执行，你可以使用基于Desktop Commander的commander工具
-你仅可使用以下工具，且需严格遵守安全规则：
+    对于代码执行，你可以使用基于Desktop Commander的commander工具
+    规则：
+    1. 只读不写，禁止修改代码文件
+    2. 可用工具：start_process(需shell+timeout≤30000)、read_file、write_file(仅新建)、list_directory等
+    3. 禁止：文件修改、危险命令、重复执行
+    4. 出错立即停止并报告
+    5. 每步说明：当前操作-预期结果-实际结果
+    6. 默认在项目根目录下的ai_gen文件夹中保存你生成的所有文件
 
-### 允许使用的工具
-1. **终端操作**：start_process（执行命令）、read_process_output（读取输出）、list_sessions（查看会话）、force_terminate（终止进程）
-2. **文件读取**：list_directory（列出目录）、read_file（读取文件）、write_file(创建新文件）、read_multiple_files（批量读取）、search_files（搜索文件）、get_file_info（查看文件信息）
-
-### 严格禁止的操作
-- 禁止使用任何文件修改工具（move_file、edit_block等）
-- 禁止修改服务器配置（set_config_value等）
-- 禁止执行删除、格式化等危险命令
-
-### 执行规则
-1. **终端命令需指定shell**
-2. 执行命令时必须设置timeout_ms（建议30000ms以内）
-3. 若命令执行出错或工具调用失败，立即终止流程并反馈错误，不得尝试修改代码或配置
-4. 所有操作仅可读取内容和执行命令，不得对代码文件做任何改动
     '''
 
     context: str = ""
@@ -101,7 +92,7 @@ class Agent:
             # 处理工具调用
             rprint(chat_resp)
             if chat_resp.tool_calls:
-                
+
                 rprint("工具返回原始结果:", chat_resp)  # 查看爬取的原始内容
                 for tool_call in chat_resp.tool_calls:
                     target_mcp_client: MCPClient | None = None
@@ -114,9 +105,26 @@ class Agent:
                     if target_mcp_client:
                         PRETTY_LOGGER.title(f"TOOL USE `{tool_call.function.name}`")
                         rprint("with args:", tool_call.function.arguments)
+
+                        # 添加JSON解析错误处理
+                        try:
+                            parsed_args = json.loads(tool_call.function.arguments)
+                        except json.JSONDecodeError as e:
+                            rprint(f"JSON parsing error: {e}")
+                            rprint(f"Raw arguments: {tool_call.function.arguments}")
+                            # 尝试修复常见的JSON问题
+                            fixed_args = tool_call.function.arguments.replace('\n', '\\n').replace('\r', '\\r').replace(
+                                '\t', '\\t')
+                            try:
+                                parsed_args = json.loads(fixed_args)
+                                rprint("Successfully fixed JSON format")
+                            except json.JSONDecodeError:
+                                rprint("Failed to fix JSON, using empty dict")
+                                parsed_args = {}
+
                         mcp_result = await target_mcp_client.call_tool(
                             tool_call.function.name,
-                            json.loads(tool_call.function.arguments),
+                            parsed_args,
                         )
                         rprint("call result:", mcp_result)
                         self.llm.append_tool_result(
@@ -150,11 +158,11 @@ async def example() -> None:
 
         resp = await agent.invoke(
             f'''
-        现在需要你完成以下操作：
-        1.阅读{PROJECT_ROOT_DIR!s}下的newdistance.py,理解我们的工作流程
-        2.撰写简要的总结文档保存在 {PROJECT_ROOT_DIR / 'ai_gen'!s} 目录下的code_summary.md文件中
-        3.根据理解撰写合适的命令以五角星模式运行该python脚本,且只能运行一次不可重复运行
-        4.读取脚本输出并最终进行测试结果总结文档保存在 {PROJECT_ROOT_DIR / 'ai_gen'!s} 目录下的test_summary.md文件中
+        请按顺序完成：
+        1. 读取{PROJECT_ROOT_DIR!s}/newdistance.py并理解代码
+        2. 写代码总结到{PROJECT_ROOT_DIR / 'ai_gen'!s}/code_summary.md
+        3. 以五角星模式运行脚本一次：python newdistance.py 1
+        4. 写测试结果到{PROJECT_ROOT_DIR / 'ai_gen'!s}/test_summary.md
             '''
         )
         rprint(resp)
