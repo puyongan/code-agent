@@ -30,7 +30,7 @@ PRETTY_LOGGER = pretty.ALogger("[Agent]")
 class State:
     def __init__(self):
         self.agent: Agent | None = None
-        self.chat_history: List[List[str]] = []  # Gradio格式：[[user, assistant], ...]
+        self.chat_history: List[Dict[str, str]] = []  # 改为messages格式：[{"role": "user", "content": "..."}, ...]
         self.console = Console(record=True)
 
 
@@ -64,10 +64,10 @@ async def gradio_query(
         base_url: str,
         api_key: str,
         temperature: float,
-        history: List[List[str]]
-) -> AsyncGenerator[tuple[List[List[str]], str], None]:
+        history: List[Dict[str, str]]
+) -> AsyncGenerator[tuple[List[Dict[str, str]], str], None]:
     """
-    改进版：支持流式输出和完整工具调用日志
+    改进版：支持真正的流式输出和完整工具调用日志
     返回: (chat_history, tool_logs)
     """
     tool_logs = "🔧 工具调用日志\n" + "=" * 80 + "\n"
@@ -79,7 +79,8 @@ async def gradio_query(
 
         # 2. 添加用户消息到历史
         current_history = history.copy()
-        current_history.append([query, ""])  # 占位，等待回复
+        current_history.append({"role": "user", "content": query})
+        current_history.append({"role": "assistant", "content": ""})  # 占位
         yield current_history, tool_logs
 
         # 3. 处理多轮工具调用
@@ -144,27 +145,24 @@ async def gradio_query(
                 yield current_history, tool_logs
                 chat_resp = await agent.llm.chat()
             else:
-                # 最终响应阶段 - 流式显示
+                # 最终响应阶段 - 真正的流式显示
                 final_response = chat_resp.content
-                tool_logs += f"✅ 生成最终回复 ({len(final_response)} 字符)\n"
-                tool_logs += f"{'=' * 80}\n"
-                tool_logs += f"总计 {round_num} 轮处理完成\n"
+                tool_logs += f"✅ 开始流式生成回复...\n"
 
-                # 模拟流式输出效果
+                # 逐字符流式输出
                 current_text = ""
-                words = final_response.split()
-
-                for i, word in enumerate(words):
-                    current_text += word + " "
-                    current_history[-1][1] = current_text.strip()
+                for i, char in enumerate(final_response):
+                    current_text += char
+                    current_history[-1]["content"] = current_text
                     yield current_history, tool_logs
 
-                    # 控制输出速度，让效果更自然
-                    if i % 3 == 0:  # 每3个词暂停一下
-                        await asyncio.sleep(0.05)
+                    # 控制输出速度 - 更快更自然
+                    if i % 5 == 0:  # 每5个字符暂停
+                        await asyncio.sleep(0.02)
 
-                # 确保最终文本完整
-                current_history[-1][1] = final_response
+                tool_logs += f"✅ 回复完成 ({len(final_response)} 字符)\n"
+                tool_logs += f"{'=' * 80}\n"
+                tool_logs += f"总计 {round_num} 轮处理完成\n"
                 yield current_history, tool_logs
                 break
 
@@ -172,8 +170,8 @@ async def gradio_query(
         error_msg = f"❌ 处理失败: {str(e)}"
         tool_logs += f"\n{error_msg}\n"
         tool_logs += f"错误详情: {repr(e)}\n"
-        if current_history and current_history[-1][1] == "":
-            current_history[-1][1] = error_msg
+        if current_history and current_history[-1]["content"] == "":
+            current_history[-1]["content"] = error_msg
         yield current_history, tool_logs
 
 
@@ -252,12 +250,12 @@ with gr.Blocks(title="Schneider Agent 交互界面", theme=gr.themes.Soft()) as 
             # 对话历史显示
             chatbot = gr.Chatbot(
                 value=[],
-                height=300,
+                height=400,
                 show_copy_button=True,
-                bubble_full_width=False,
                 show_share_button=False,
                 avatar_images=None,
-                container=True
+                container=True,
+                type='messages'
             )
 
             # 输入区域
@@ -313,7 +311,6 @@ if __name__ == "__main__":
     demo.queue().launch(
         server_name="localhost",
         server_port=9999,
-        auth=("zhangsan", "123456"),
         share=False,
         debug=True
     )
