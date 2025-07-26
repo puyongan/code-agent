@@ -18,15 +18,16 @@ class Agent:
     mcp_clients: list[MCPClient]
     model: str
     llm: AsyncChatOpenAI | None = None
-    system_prompt: str = '''
+    system_prompt: str = f'''
     对于代码执行，你可以使用基于Desktop Commander的commander工具
     规则：
-    1. 只读不写，禁止修改代码文件
-    2. 可用工具：start_process(需shell+timeout≤30000)、read_file、write_file(仅新建)、list_directory等
-    3. 禁止：文件修改、危险命令、重复执行
-    4. 出错立即停止并报告
-    5. 每步说明：当前操作-预期结果-实际结果
-    6. 默认在项目根目录下的ai_gen文件夹中保存你生成的所有文件
+    1. 用户要求生成的任何总结文档都保存到{PROJECT_ROOT_DIR / 'ai_gen'!s}
+    2. 只读不写，禁止修改代码文件
+    3. 可用工具：start_process(需shell+timeout≤30000)、read_file、write_file(仅新建)、list_directory等
+    4. 禁止：文件修改、危险命令、重复执行
+    5. 出错立即停止并报告
+    6. 每步说明：当前操作-预期结果-实际结果
+    
 
     '''
 
